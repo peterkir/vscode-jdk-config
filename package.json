@@ -1,0 +1,80 @@
+{
+  "name": "vscode-jre-config",
+  "displayName": "Java Runtime Configurator",
+  "description": "Find JDK and JRE installations under selected folders and add them to java.configuration.runtimes.",
+  "icon": "assets/icon.png",
+  "version": "0.3.0",
+  "publisher": "local",
+  "license": "EPL-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/peterkir/vscode-jre-config.git"
+  },
+  "homepage": "https://github.com/peterkir/vscode-jre-config",
+  "bugs": {
+    "url": "https://github.com/peterkir/vscode-jre-config/issues"
+  },
+  "keywords": [
+    "java",
+    "jdk",
+    "jre",
+    "runtime",
+    "configuration",
+    "javase",
+    "openjdk",
+    "settings",
+    "workspace"
+  ],
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Scanning local Java installations requires direct filesystem access."
+    }
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "files": [
+    "dist/**",
+    "assets/icon.png",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "vscode-jre-config.scanJavaRuntimes",
+        "title": "Scan Folders and Configure",
+        "category": "Java Runtimes",
+        "shortTitle": "Scan Java Runtimes"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "pretest": "npm run compile",
+    "test": "node ./dist/test/runTest.js",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package": "npm run compile && npx @vscode/vsce package",
+    "package:bash": "npm run compile && npx @vscode/vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "@types/mocha": "^10.0.10",
+    "@types/vscode": "^1.100.0",
+    "@vscode/test-electron": "^2.5.2",
+    "@vscode/vsce": "^3.6.0",
+    "canvas": "^3.2.3",
+    "mocha": "^11.7.5",
+    "typescript": "^5.8.3"
+  }
+}

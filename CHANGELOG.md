@@ -2,6 +2,10 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.6.2
+
+- Updated VSIX packaging dependency to `@vscode/vsce` 4.0.0 to remove the outdated-version warning.
+
 ## 0.6.1
 
 - Added a white background and subtle border to the extension icon for readability in light and dark themes.

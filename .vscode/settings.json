@@ -1,0 +1,29 @@
+{
+    "java.configuration.runtimes": [
+        {
+            "name": "JavaSE-21",
+            "path": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA21-JAVAFX",
+            "label": "JAVA21-JAVAFX",
+            "sources": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA21-JAVAFX\\lib\\src.zip"
+        },
+        {
+            "name": "JavaSE-21",
+            "path": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA21",
+            "label": "JAVA21",
+            "sources": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA21\\lib\\src.zip",
+            "default": true
+        },
+        {
+            "name": "JavaSE-17",
+            "path": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA17",
+            "label": "JAVA17",
+            "sources": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA17\\lib\\src.zip"
+        },
+        {
+            "name": "JavaSE-11",
+            "path": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA11",
+            "label": "JAVA11",
+            "sources": "c:\\Users\\PEKIRSC\\.ecdev\\java\\ee\\JAVA11\\lib\\src.zip"
+        }
+    ]
+}

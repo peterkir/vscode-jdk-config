@@ -12,6 +12,7 @@ interface JavaRuntimeConfigEntry {
   default?: boolean;
   sources?: string;
   javadoc?: string;
+  label?: string;
   [key: string]: unknown;
 }
 
@@ -20,6 +21,7 @@ interface DiscoveredRuntime {
   path: string;
   kind: RuntimeKind;
   version?: string;
+  label?: string;
   sources?: string;
   javadoc?: string;
 }
@@ -44,27 +46,52 @@ const DIRECTORY_SKIP_NAMES = new Set([
 ]);
 
 export function activate(context: vscode.ExtensionContext): void {
+  const results = vscode.window.createOutputChannel('Java Runtime Configurator');
   const command = vscode.commands.registerCommand('vscode-jre-config.scanJavaRuntimes', async () => {
-    await scanAndConfigureJavaRuntimes();
+    await scanAndConfigureJavaRuntimes(results);
   });
 
-  context.subscriptions.push(command);
+  context.subscriptions.push(command, results);
 }
 
 export function deactivate(): void {}
 
-async function scanAndConfigureJavaRuntimes(): Promise<void> {
-  const defaultSearchRootUri = await resolveDefaultSearchRootUri();
-  const roots = await vscode.window.showOpenDialog({
-    canSelectFiles: false,
-    canSelectFolders: true,
-    canSelectMany: true,
-    defaultUri: defaultSearchRootUri,
-    openLabel: 'Scan for Java runtimes',
-    title: 'Select one or more root folders to search for JDKs or JREs'
+async function scanAndConfigureJavaRuntimes(results: vscode.OutputChannel): Promise<void> {
+  const choice = await vscode.window.showQuickPick(['Scan common Java installation locations', 'Choose folders...'], {
+    title: 'Where should Java runtimes be searched?'
   });
+  if (!choice) {
+    return;
+  }
 
-  if (!roots || roots.length === 0) {
+  let roots: string[];
+  if (choice === 'Scan common Java installation locations') {
+    const candidates = getDefaultJavaSearchPaths(process.platform, os.homedir(), process.env);
+    const existing = await Promise.all(candidates.map(async (candidate) => {
+      try {
+        return (await fs.stat(candidate)).isDirectory() ? candidate : undefined;
+      } catch {
+        return undefined;
+      }
+    }));
+    roots = existing.filter((candidate): candidate is string => Boolean(candidate));
+    if (roots.length === 0) {
+      vscode.window.showWarningMessage('No common Java installation folders were found. Choose folders to scan instead.');
+      return;
+    }
+  } else {
+    const selected = await vscode.window.showOpenDialog({
+      canSelectFiles: false,
+      canSelectFolders: true,
+      canSelectMany: true,
+      defaultUri: await resolveDefaultSearchRootUri(),
+      openLabel: 'Scan for Java runtimes',
+      title: 'Select one or more root folders to search for JDKs or JREs'
+    });
+    roots = selected?.map((uri) => uri.fsPath) ?? [];
+  }
+
+  if (roots.length === 0) {
     return;
   }
 
@@ -74,30 +101,82 @@ async function scanAndConfigureJavaRuntimes(): Promise<void> {
       title: 'Scanning selected folders for Java runtimes',
       cancellable: false
     },
-    async () => {
-      const discovered = await findJavaRuntimes(roots.map((uri) => uri.fsPath));
+    async (progress) => {
+      progress.report({ message: `Scanning ${roots.length} selected folder${roots.length === 1 ? '' : 's'}...` });
+      const discovered = await findJavaRuntimes(roots, (folders, found) => {
+        progress.report({ message: `Scanned ${folders} folders; found ${found} Java runtimes` });
+      });
 
       if (discovered.length === 0) {
+        results.clear();
+        results.appendLine('No Java runtimes found in the selected folders.');
         vscode.window.showWarningMessage('No Java runtimes were found in the selected folders.');
         return;
       }
 
       const config = vscode.workspace.getConfiguration(JAVA_CONFIG_SECTION);
-      const existing = config.get<JavaRuntimeConfigEntry[]>(JAVA_RUNTIMES_KEY, []);
-      const { merged, added } = mergeRuntimeEntries(existing, discovered);
+      const inspected = config.inspect<JavaRuntimeConfigEntry[]>(JAVA_RUNTIMES_KEY);
+      const { merged, added } = mergeRuntimeEntries(inspected?.globalValue ?? [], discovered);
 
       if (added.length > 0) {
         await config.update(JAVA_RUNTIMES_KEY, merged, vscode.ConfigurationTarget.Global);
-
-        const runtimeSummary = added.map((runtime) => `${runtime.name} (${runtime.kind.toUpperCase()})`).join(', ');
-        vscode.window.showInformationMessage(`Added ${added.length} Java runtime${added.length === 1 ? '' : 's'} to java.configuration.runtimes: ${runtimeSummary}`);
-      } else {
-        vscode.window.showInformationMessage('All discovered Java runtimes are already present in java.configuration.runtimes.');
       }
 
-      await promptAndStoreWorkspaceDefaultRuntime(config, merged);
+      const workspaceRuntimes = inspected?.workspaceValue
+        ? mergeWorkspaceRuntimes(inspected.workspaceValue, merged)
+        : merged;
+      if (inspected?.workspaceValue && workspaceRuntimes.length !== inspected.workspaceValue.length) {
+        await config.update(JAVA_RUNTIMES_KEY, workspaceRuntimes, vscode.ConfigurationTarget.Workspace);
+      }
+
+      const addedPaths = new Set(added.map((runtime) => normalizeFsPath(runtime.path)));
+      results.clear();
+      results.appendLine(`Found ${discovered.length} Java runtimes; added ${added.length} to user settings; ${discovered.length - added.length} already present.`);
+      for (const runtime of discovered) {
+        const status = addedPaths.has(normalizeFsPath(runtime.path)) ? 'ADDED' : 'ALREADY PRESENT';
+        results.appendLine(`${status}: ${runtime.label || runtime.name} [${runtime.name}] ${runtime.kind.toUpperCase()} ${runtime.version ?? 'version unknown'} - ${runtime.path}`);
+      }
+      results.show(true);
+      vscode.window.showInformationMessage(`Found ${discovered.length} Java runtimes; added ${added.length} to user settings. Details in Java Runtime Configurator output.`);
+
+      await promptAndStoreWorkspaceDefaultRuntime(config, workspaceRuntimes);
     }
   );
+}
+
+function getDefaultJavaSearchPaths(platform: NodeJS.Platform, homeDirectory: string, environment: NodeJS.ProcessEnv): string[] {
+  if (platform === 'win32') {
+    const programFiles = [environment.ProgramFiles, environment['ProgramFiles(x86)']].filter((folder): folder is string => Boolean(folder));
+    const vendorFolders = ['Java', 'Eclipse Adoptium', 'Adoptium', 'Azul Systems', 'Zulu', 'GraalVM', 'Amazon Corretto'];
+    return [
+      ...programFiles.flatMap((folder) => vendorFolders.map((vendor) => path.win32.join(folder, vendor))),
+      path.win32.join(homeDirectory, '.jdks')
+    ];
+  }
+
+  if (platform === 'darwin') {
+    return [
+      '/Library/Java/JavaVirtualMachines',
+      path.join(homeDirectory, 'Library', 'Java', 'JavaVirtualMachines'),
+      '/opt/homebrew/Cellar/openjdk',
+      '/usr/local/Cellar/openjdk',
+      path.join(homeDirectory, '.sdkman', 'candidates', 'java')
+    ];
+  }
+
+  return [
+    '/usr/lib/jvm',
+    '/usr/java',
+    '/opt/java',
+    '/opt/jdk',
+    '/opt/temurin',
+    '/opt/graalvm',
+    '/opt/azul',
+    '/opt/zulu',
+    '/opt/amazon-corretto',
+    path.join(homeDirectory, '.sdkman', 'candidates', 'java'),
+    path.join(homeDirectory, '.jdks')
+  ];
 }
 
 async function resolveDefaultSearchRootUri(): Promise<vscode.Uri | undefined> {
@@ -117,7 +196,7 @@ async function resolveDefaultSearchRootUri(): Promise<vscode.Uri | undefined> {
   return vscode.Uri.file(searchRootPath);
 }
 
-async function findJavaRuntimes(rootPaths: string[]): Promise<DiscoveredRuntime[]> {
+async function findJavaRuntimes(rootPaths: string[], onProgress?: (folders: number, found: number) => void): Promise<DiscoveredRuntime[]> {
   const pending = [...new Set(rootPaths.map((rootPath) => path.resolve(rootPath)))];
   const visited = new Set<string>();
   const discoveredByPath = new Map<string, DiscoveredRuntime>();
@@ -137,6 +216,7 @@ async function findJavaRuntimes(rootPaths: string[]): Promise<DiscoveredRuntime[
     const runtime = await inspectJavaHome(currentPath);
     if (runtime) {
       discoveredByPath.set(normalizedCurrentPath, runtime);
+      onProgress?.(visited.size, discoveredByPath.size);
       continue;
     }
 
@@ -154,8 +234,12 @@ async function findJavaRuntimes(rootPaths: string[]): Promise<DiscoveredRuntime[
 
       pending.push(path.join(currentPath, entry.name));
     }
+    if (visited.size % 25 === 0) {
+      onProgress?.(visited.size, discoveredByPath.size);
+    }
   }
 
+  onProgress?.(visited.size, discoveredByPath.size);
   return [...discoveredByPath.values()].sort(compareDiscoveredRuntimes);
 }
 
@@ -178,7 +262,8 @@ async function inspectJavaHome(homePath: string): Promise<DiscoveredRuntime | un
   const version = releaseInfo.get('JAVA_VERSION');
   const kind: RuntimeKind = javacBinary ? 'jdk' : 'jre';
   const runtimeFolderName = path.basename(homePath);
-  const name = buildRuntimeName(runtimeFolderName, version);
+  const name = buildExecutionEnvironmentName(version, runtimeFolderName);
+  const label = buildRuntimeLabel(runtimeFolderName, version);
   const sources = await findRuntimeSources(homePath);
   const javadoc = await findRuntimeJavadoc(homePath, runtimeFolderName);
 
@@ -187,6 +272,7 @@ async function inspectJavaHome(homePath: string): Promise<DiscoveredRuntime | un
     path: homePath,
     kind,
     version,
+    label,
     sources,
     javadoc
   };
@@ -249,6 +335,7 @@ function mergeRuntimeEntries(
     merged.push({
       name: runtime.name,
       path: runtime.path,
+      ...(runtime.label ? { label: runtime.label } : {}),
       ...(runtime.sources ? { sources: runtime.sources } : {}),
       ...(runtime.javadoc ? { javadoc: runtime.javadoc } : {})
     });
@@ -257,6 +344,44 @@ function mergeRuntimeEntries(
   }
 
   return { merged, added };
+}
+
+function mergeWorkspaceRuntimes(workspaceRuntimes: JavaRuntimeConfigEntry[], userRuntimes: JavaRuntimeConfigEntry[]): JavaRuntimeConfigEntry[] {
+  const merged = [...workspaceRuntimes];
+  const paths = new Set(merged.map((runtime) => normalizeFsPath(runtime.path)));
+  for (const runtime of userRuntimes) {
+    const normalizedPath = normalizeFsPath(runtime.path);
+    if (!paths.has(normalizedPath)) {
+      const workspaceRuntime = { ...runtime };
+      delete workspaceRuntime.default;
+      merged.push(workspaceRuntime);
+      paths.add(normalizedPath);
+    }
+  }
+  return merged;
+}
+
+function buildExecutionEnvironmentName(version: string | undefined, fallbackFolderName: string): string {
+  if (version) {
+    const eeLabel = toJavaSeLabel(version);
+    if (eeLabel) {
+      return eeLabel;
+    }
+  }
+
+  // Attempt to extract major version from folder name (e.g. JAVA17, Java-21)
+  const folderMajor = extractJavaMajor(fallbackFolderName);
+  if (folderMajor) {
+    return folderMajor.startsWith('1.') || Number.parseInt(folderMajor, 10) <= 5
+      ? (folderMajor === '1.5' ? 'J2SE-1.5' : `JavaSE-${folderMajor}`)
+      : `JavaSE-${folderMajor}`;
+  }
+
+  return fallbackFolderName;
+}
+
+function buildRuntimeLabel(runtimeFolderName: string, version: string | undefined): string {
+  return buildRuntimeName(runtimeFolderName, version);
 }
 
 function buildRuntimeName(runtimeFolderName: string, version: string | undefined): string {
@@ -312,7 +437,7 @@ async function promptAndStoreWorkspaceDefaultRuntime(
   const quickPickItems = runtimes
     .filter((runtime) => runtime.path)
     .map((runtime) => ({
-      label: runtime.name,
+      label: runtime.label ? `${runtime.label} (${runtime.name})` : runtime.name,
       description: runtime.path,
       runtime
     }));
@@ -347,7 +472,13 @@ async function promptAndStoreWorkspaceDefaultRuntime(
 
 function toJavaSeLabel(version: string): string | undefined {
   const major = extractJavaMajor(version);
-  return major ? `JavaSE-${major}` : undefined;
+  if (!major) {
+    return undefined;
+  }
+  if (major === '1.5') {
+    return 'J2SE-1.5';
+  }
+  return `JavaSE-${major}`;
 }
 
 function extractJavaMajor(version: string): string | undefined {
@@ -361,7 +492,8 @@ function extractJavaMajor(version: string): string | undefined {
     return legacyMatch ? `1.${legacyMatch[1]}` : undefined;
   }
 
-  const modernMatch = /^(\d+)/u.exec(cleanedVersion);
+  // Handle forms like 21.0.2, 21-ea, JAVA21, jdk-17, etc.
+  const modernMatch = /(?:^|[^\d])(\d+)(?:[^\d]|$)/u.exec(cleanedVersion);
   return modernMatch ? modernMatch[1] : undefined;
 }
 
@@ -418,10 +550,17 @@ function normalizeVersionParts(version: string): number[] {
 }
 
 export const testables = {
+  buildExecutionEnvironmentName,
+  buildRuntimeLabel,
   buildRuntimeName,
   compareJavaVersions,
   extractJavaMajor,
+  findJavaRuntimes,
+  getDefaultJavaSearchPaths,
+  mergeRuntimeEntries,
+  mergeWorkspaceRuntimes,
   normalizeFsPath,
   normalizeVersionParts,
-  shouldSkipDirectory
+  shouldSkipDirectory,
+  toJavaSeLabel
 };

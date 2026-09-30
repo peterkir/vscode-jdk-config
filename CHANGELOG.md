@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file.
 
+## 0.7.2
+
+- Write descriptive runtime metadata as JSONC comments above `java.configuration.runtimes` entries instead of unsupported `label` properties, using the active VS Code profile's settings file.
+
+## 0.7.1
+
+- Revalidate configured Java runtimes on every scan and refresh their version, label, sources, and javadoc in user and workspace settings while retaining workspace defaults.
+- Report configured paths without a detectable Java installation without deleting them.
+
+## 0.7.0
+
+- The manual folder picker now opens in the user home folder (`%USERPROFILE%` on Windows, `$HOME` otherwise) instead of creating a `jdk-search` folder.
+- Symlinked and junction folders are now followed during scanning, with real-path deduplication so a runtime is reported only once.
+- Runtime labels now show kind, major version, vendor and full version, e.g. `[JDK 25] Temurin 25.0.4.1+1-LTS`.
+
 ## 0.6.2
 
 - Updated VSIX packaging dependency to `@vscode/vsce` 4.0.0 to remove the outdated-version warning.

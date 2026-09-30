@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { findNodeAtLocation, getNodeValue, parseTree } from 'jsonc-parser';
 
 type RuntimeKind = 'jdk' | 'jre';
 
@@ -28,7 +29,22 @@ interface DiscoveredRuntime {
 
 const JAVA_CONFIG_SECTION = 'java';
 const JAVA_RUNTIMES_KEY = 'configuration.runtimes';
-const JDK_SEARCH_FOLDER_NAME = 'jdk-search';
+const VENDOR_PATTERNS: Array<[RegExp, string]> = [
+  [/adoptium|temurin/iu, 'Temurin'],
+  [/adoptopenjdk/iu, 'AdoptOpenJDK'],
+  [/azul|zulu/iu, 'Azul'],
+  [/oracle/iu, 'Oracle'],
+  [/amazon|corretto/iu, 'Corretto'],
+  [/bellsoft|liberica/iu, 'Liberica'],
+  [/microsoft/iu, 'Microsoft'],
+  [/red\s*hat/iu, 'Red Hat'],
+  [/sap/iu, 'SapMachine'],
+  [/ibm|semeru/iu, 'IBM'],
+  [/graalvm/iu, 'GraalVM'],
+  [/alibaba|dragonwell/iu, 'Dragonwell'],
+  [/tencent|kona/iu, 'Kona'],
+  [/debian|ubuntu|n\/a/iu, 'OpenJDK']
+];
 const DIRECTORY_SKIP_NAMES = new Set([
   '.git',
   '.gradle',
@@ -48,7 +64,7 @@ const DIRECTORY_SKIP_NAMES = new Set([
 export function activate(context: vscode.ExtensionContext): void {
   const results = vscode.window.createOutputChannel('Java Runtime Configurator');
   const command = vscode.commands.registerCommand('vscode-jre-config.scanJavaRuntimes', async () => {
-    await scanAndConfigureJavaRuntimes(results);
+    await scanAndConfigureJavaRuntimes(results, resolveUserSettingsUri(context.globalStorageUri));
   });
 
   context.subscriptions.push(command, results);
@@ -56,7 +72,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {}
 
-async function scanAndConfigureJavaRuntimes(results: vscode.OutputChannel): Promise<void> {
+async function scanAndConfigureJavaRuntimes(results: vscode.OutputChannel, userSettingsUri: vscode.Uri): Promise<void> {
   const choice = await vscode.window.showQuickPick(['Scan common Java installation locations', 'Choose folders...'], {
     title: 'Where should Java runtimes be searched?'
   });
@@ -107,39 +123,75 @@ async function scanAndConfigureJavaRuntimes(results: vscode.OutputChannel): Prom
         progress.report({ message: `Scanned ${folders} folders; found ${found} Java runtimes` });
       });
 
-      if (discovered.length === 0) {
-        results.clear();
-        results.appendLine('No Java runtimes found in the selected folders.');
-        vscode.window.showWarningMessage('No Java runtimes were found in the selected folders.');
-        return;
-      }
-
       const config = vscode.workspace.getConfiguration(JAVA_CONFIG_SECTION);
       const inspected = config.inspect<JavaRuntimeConfigEntry[]>(JAVA_RUNTIMES_KEY);
-      const { merged, added } = mergeRuntimeEntries(inspected?.globalValue ?? [], discovered);
+      const globalRuntimes = inspected?.globalValue ?? [];
+      const configuredPaths = new Map([...globalRuntimes, ...(inspected?.workspaceValue ?? [])]
+        .map((runtime) => runtime.path)
+        .filter((runtimePath): runtimePath is string => typeof runtimePath === 'string' && Boolean(runtimePath))
+        .map((runtimePath) => [normalizeFsPath(runtimePath), runtimePath]));
+      const discoveredByPath = new Map(discovered.map((runtime) => [normalizeFsPath(runtime.path), runtime]));
+      const invalidPaths: string[] = [];
+      for (const [normalizedPath, runtimePath] of configuredPaths) {
+        if (discoveredByPath.has(normalizedPath)) {
+          continue;
+        }
+        const runtime = await inspectJavaHome(runtimePath);
+        if (runtime) {
+          discoveredByPath.set(normalizedPath, runtime);
+        } else {
+          invalidPaths.push(runtimePath);
+        }
+      }
 
-      if (added.length > 0) {
+      const { merged, added, updated } = mergeRuntimeEntries(globalRuntimes, [
+        ...discovered,
+        ...globalRuntimes.map((runtime) => discoveredByPath.get(normalizeFsPath(runtime.path))).filter((runtime): runtime is DiscoveredRuntime => Boolean(runtime))
+      ]);
+
+      if (JSON.stringify(merged) !== JSON.stringify(globalRuntimes)) {
         await config.update(JAVA_RUNTIMES_KEY, merged, vscode.ConfigurationTarget.Global);
       }
 
+      const workspacePaths = new Set(inspected?.workspaceValue?.map((runtime) => normalizeFsPath(runtime.path)) ?? []);
       const workspaceRuntimes = inspected?.workspaceValue
-        ? mergeWorkspaceRuntimes(inspected.workspaceValue, merged)
+        ? mergeWorkspaceRuntimes(
+            mergeRuntimeEntries(inspected.workspaceValue, [...discoveredByPath.values()].filter((runtime) =>
+              workspacePaths.has(normalizeFsPath(runtime.path))
+            )).merged,
+            merged,
+            new Set(discoveredByPath.keys())
+          )
         : merged;
-      if (inspected?.workspaceValue && workspaceRuntimes.length !== inspected.workspaceValue.length) {
+      if (inspected?.workspaceValue && JSON.stringify(workspaceRuntimes) !== JSON.stringify(inspected.workspaceValue)) {
         await config.update(JAVA_RUNTIMES_KEY, workspaceRuntimes, vscode.ConfigurationTarget.Workspace);
       }
 
       const addedPaths = new Set(added.map((runtime) => normalizeFsPath(runtime.path)));
+      const updatedPaths = new Set(updated.map((runtime) => normalizeFsPath(runtime.path)));
       results.clear();
-      results.appendLine(`Found ${discovered.length} Java runtimes; added ${added.length} to user settings; ${discovered.length - added.length} already present.`);
+      results.appendLine(`Found ${discovered.length} Java runtimes; added ${added.length} to user settings; updated ${updated.length}; ${invalidPaths.length} configured paths could not be validated.`);
       for (const runtime of discovered) {
-        const status = addedPaths.has(normalizeFsPath(runtime.path)) ? 'ADDED' : 'ALREADY PRESENT';
+        const status = addedPaths.has(normalizeFsPath(runtime.path)) ? 'ADDED' : updatedPaths.has(normalizeFsPath(runtime.path)) ? 'UPDATED' : 'ALREADY PRESENT';
         results.appendLine(`${status}: ${runtime.label || runtime.name} [${runtime.name}] ${runtime.kind.toUpperCase()} ${runtime.version ?? 'version unknown'} - ${runtime.path}`);
       }
+      for (const runtimePath of invalidPaths) {
+        results.appendLine(`NOT VALIDATED: ${runtimePath}`);
+      }
       results.show(true);
-      vscode.window.showInformationMessage(`Found ${discovered.length} Java runtimes; added ${added.length} to user settings. Details in Java Runtime Configurator output.`);
+      vscode.window.showInformationMessage(`Found ${discovered.length} Java runtimes; added ${added.length}, updated ${updated.length} in user settings. Details in Java Runtime Configurator output.`);
 
-      await promptAndStoreWorkspaceDefaultRuntime(config, workspaceRuntimes);
+      await promptAndStoreWorkspaceDefaultRuntime(config, workspaceRuntimes, discoveredByPath);
+      await updateRuntimeSettingComments(
+        userSettingsUri,
+        [JAVA_CONFIG_SECTION + '.' + JAVA_RUNTIMES_KEY],
+        discoveredByPath,
+        results
+      );
+      const workspaceSettings = resolveWorkspaceSettingsDocument();
+      if (workspaceSettings) {
+        await updateRuntimeSettingComments(workspaceSettings.uri, workspaceSettings.path, discoveredByPath, results);
+      }
     }
   );
 }
@@ -179,21 +231,14 @@ function getDefaultJavaSearchPaths(platform: NodeJS.Platform, homeDirectory: str
   ];
 }
 
+function resolveUserHomeDirectory(platform: NodeJS.Platform, environment: NodeJS.ProcessEnv, fallbackHome: string): string | undefined {
+  const explicitHome = platform === 'win32' ? environment.USERPROFILE : environment.HOME;
+  return explicitHome?.trim() || fallbackHome?.trim() || undefined;
+}
+
 async function resolveDefaultSearchRootUri(): Promise<vscode.Uri | undefined> {
-  const explicitHome = process.platform === 'win32' ? process.env.USERPROFILE : process.env.HOME;
-  const homeDirectory = explicitHome?.trim() || os.homedir();
-  if (!homeDirectory) {
-    return undefined;
-  }
-
-  const searchRootPath = path.join(homeDirectory, JDK_SEARCH_FOLDER_NAME);
-  try {
-    await fs.mkdir(searchRootPath, { recursive: true });
-  } catch {
-    return vscode.Uri.file(homeDirectory);
-  }
-
-  return vscode.Uri.file(searchRootPath);
+  const homeDirectory = resolveUserHomeDirectory(process.platform, process.env, os.homedir());
+  return homeDirectory ? vscode.Uri.file(homeDirectory) : undefined;
 }
 
 async function findJavaRuntimes(rootPaths: string[], onProgress?: (folders: number, found: number) => void): Promise<DiscoveredRuntime[]> {
@@ -213,6 +258,15 @@ async function findJavaRuntimes(rootPaths: string[], onProgress?: (folders: numb
     }
     visited.add(normalizedCurrentPath);
 
+    // Symlinked runtimes resolve to the same target; keep only one entry per real location.
+    const realCurrentPath = await resolveRealPath(currentPath);
+    if (realCurrentPath !== normalizedCurrentPath) {
+      if (visited.has(realCurrentPath)) {
+        continue;
+      }
+      visited.add(realCurrentPath);
+    }
+
     const runtime = await inspectJavaHome(currentPath);
     if (runtime) {
       discoveredByPath.set(normalizedCurrentPath, runtime);
@@ -228,11 +282,14 @@ async function findJavaRuntimes(rootPaths: string[], onProgress?: (folders: numb
     }
 
     for (const entry of entries) {
-      if (!entry.isDirectory() || entry.isSymbolicLink() || shouldSkipDirectory(entry.name)) {
+      if (shouldSkipDirectory(entry.name)) {
         continue;
       }
 
-      pending.push(path.join(currentPath, entry.name));
+      const entryPath = path.join(currentPath, entry.name);
+      if (entry.isDirectory() || (entry.isSymbolicLink() && (await isDirectoryPath(entryPath)))) {
+        pending.push(entryPath);
+      }
     }
     if (visited.size % 25 === 0) {
       onProgress?.(visited.size, discoveredByPath.size);
@@ -263,7 +320,11 @@ async function inspectJavaHome(homePath: string): Promise<DiscoveredRuntime | un
   const kind: RuntimeKind = javacBinary ? 'jdk' : 'jre';
   const runtimeFolderName = path.basename(homePath);
   const name = buildExecutionEnvironmentName(version, runtimeFolderName);
-  const label = buildRuntimeLabel(runtimeFolderName, version);
+  const label = buildRuntimeLabel(runtimeFolderName, version, {
+    kind,
+    vendor: resolveVendor(releaseInfo),
+    runtimeVersion: releaseInfo.get('JAVA_RUNTIME_VERSION')
+  });
   const sources = await findRuntimeSources(homePath);
   const javadoc = await findRuntimeJavadoc(homePath, runtimeFolderName);
 
@@ -321,44 +382,74 @@ async function readJavaReleaseInfo(releaseFilePath: string): Promise<Map<string,
 function mergeRuntimeEntries(
   existing: JavaRuntimeConfigEntry[],
   discovered: DiscoveredRuntime[]
-): { merged: JavaRuntimeConfigEntry[]; added: DiscoveredRuntime[] } {
-  const merged = [...existing];
-  const existingPaths = new Set(existing.map((entry) => normalizeFsPath(entry.path)).filter(Boolean));
+): { merged: JavaRuntimeConfigEntry[]; added: DiscoveredRuntime[]; updated: DiscoveredRuntime[] } {
+  const merged = existing.map((entry) => {
+    const cleaned = { ...entry };
+    delete cleaned.label;
+    return cleaned;
+  });
+  const existingPaths = new Map(existing.map((entry, index) => [normalizeFsPath(entry.path), index] as const).filter(([runtimePath]) => Boolean(runtimePath)));
   const added: DiscoveredRuntime[] = [];
+  const updated: DiscoveredRuntime[] = [];
 
   for (const runtime of discovered) {
     const normalizedPath = normalizeFsPath(runtime.path);
-    if (existingPaths.has(normalizedPath)) {
+    const existingIndex = existingPaths.get(normalizedPath);
+    if (existingIndex !== undefined) {
+      const previous = merged[existingIndex];
+      const refreshed = refreshRuntimeEntry(previous, runtime);
+      if (JSON.stringify(refreshed) !== JSON.stringify(previous)) {
+        merged[existingIndex] = refreshed;
+        updated.push(runtime);
+      }
       continue;
     }
 
     merged.push({
       name: runtime.name,
       path: runtime.path,
-      ...(runtime.label ? { label: runtime.label } : {}),
       ...(runtime.sources ? { sources: runtime.sources } : {}),
       ...(runtime.javadoc ? { javadoc: runtime.javadoc } : {})
     });
-    existingPaths.add(normalizedPath);
+    existingPaths.set(normalizedPath, merged.length - 1);
     added.push(runtime);
   }
 
-  return { merged, added };
+  return { merged, added, updated };
 }
 
-function mergeWorkspaceRuntimes(workspaceRuntimes: JavaRuntimeConfigEntry[], userRuntimes: JavaRuntimeConfigEntry[]): JavaRuntimeConfigEntry[] {
+function mergeWorkspaceRuntimes(workspaceRuntimes: JavaRuntimeConfigEntry[], userRuntimes: JavaRuntimeConfigEntry[], validatedPaths = new Set(userRuntimes.map((runtime) => normalizeFsPath(runtime.path)))): JavaRuntimeConfigEntry[] {
   const merged = [...workspaceRuntimes];
-  const paths = new Set(merged.map((runtime) => normalizeFsPath(runtime.path)));
+  const paths = new Map(merged.map((runtime, index) => [normalizeFsPath(runtime.path), index] as const));
   for (const runtime of userRuntimes) {
     const normalizedPath = normalizeFsPath(runtime.path);
-    if (!paths.has(normalizedPath)) {
+    const existingIndex = paths.get(normalizedPath);
+    if (existingIndex === undefined) {
       const workspaceRuntime = { ...runtime };
       delete workspaceRuntime.default;
       merged.push(workspaceRuntime);
-      paths.add(normalizedPath);
+      paths.set(normalizedPath, merged.length - 1);
+    } else if (validatedPaths.has(normalizedPath)) {
+      merged[existingIndex] = refreshRuntimeEntry(merged[existingIndex], runtime);
     }
   }
   return merged;
+}
+
+function refreshRuntimeEntry(previous: JavaRuntimeConfigEntry, runtime: Pick<JavaRuntimeConfigEntry, 'name' | 'sources' | 'javadoc'>): JavaRuntimeConfigEntry {
+  const refreshed = { ...previous, name: runtime.name };
+  delete refreshed.label;
+  if (runtime.sources) {
+    refreshed.sources = runtime.sources;
+  } else {
+    delete refreshed.sources;
+  }
+  if (runtime.javadoc) {
+    refreshed.javadoc = runtime.javadoc;
+  } else {
+    delete refreshed.javadoc;
+  }
+  return refreshed;
 }
 
 function buildExecutionEnvironmentName(version: string | undefined, fallbackFolderName: string): string {
@@ -380,8 +471,40 @@ function buildExecutionEnvironmentName(version: string | undefined, fallbackFold
   return fallbackFolderName;
 }
 
-function buildRuntimeLabel(runtimeFolderName: string, version: string | undefined): string {
-  return buildRuntimeName(runtimeFolderName, version);
+function buildRuntimeLabel(
+  runtimeFolderName: string,
+  version: string | undefined,
+  details?: { kind?: RuntimeKind; vendor?: string; runtimeVersion?: string }
+): string {
+  if (!details?.kind) {
+    return buildRuntimeName(runtimeFolderName, version);
+  }
+
+  const major = version ? extractJavaMajor(version) : undefined;
+  const prefix = major ? `[${details.kind.toUpperCase()} ${major}]` : `[${details.kind.toUpperCase()}]`;
+  const fullVersion = (details.runtimeVersion ?? version)?.trim().replace(/^"|"$/gu, '');
+  const suffix = [details.vendor, fullVersion].filter(Boolean).join(' ');
+
+  return `${prefix} ${suffix || buildRuntimeName(runtimeFolderName, version)}`;
+}
+
+function resolveVendor(releaseInfo: Map<string, string>): string | undefined {
+  const implementorVersion = releaseInfo.get('IMPLEMENTOR_VERSION')?.trim();
+  const candidates = [implementorVersion, releaseInfo.get('IMPLEMENTOR'), releaseInfo.get('JAVA_RUNTIME_VERSION')];
+
+  for (const candidate of candidates) {
+    if (!candidate) {
+      continue;
+    }
+    const match = VENDOR_PATTERNS.find(([pattern]) => pattern.test(candidate));
+    if (match) {
+      return match[1];
+    }
+  }
+
+  // Vendor builds often encode their brand as "<Brand>-<version>" in IMPLEMENTOR_VERSION.
+  const brandMatch = implementorVersion ? /^([A-Za-z][A-Za-z ]*?)[-_ ]?\d/u.exec(implementorVersion) : undefined;
+  return brandMatch?.[1].trim() || releaseInfo.get('IMPLEMENTOR')?.trim() || undefined;
 }
 
 function buildRuntimeName(runtimeFolderName: string, version: string | undefined): string {
@@ -428,7 +551,8 @@ async function findRuntimeJavadoc(homePath: string, runtimeFolderName: string): 
 
 async function promptAndStoreWorkspaceDefaultRuntime(
   config: vscode.WorkspaceConfiguration,
-  runtimes: JavaRuntimeConfigEntry[]
+  runtimes: JavaRuntimeConfigEntry[],
+  discoveredByPath: ReadonlyMap<string, DiscoveredRuntime>
 ): Promise<void> {
   if (runtimes.length === 0 || !vscode.workspace.workspaceFolders || vscode.workspace.workspaceFolders.length === 0) {
     return;
@@ -436,11 +560,14 @@ async function promptAndStoreWorkspaceDefaultRuntime(
 
   const quickPickItems = runtimes
     .filter((runtime) => runtime.path)
-    .map((runtime) => ({
-      label: runtime.label ? `${runtime.label} (${runtime.name})` : runtime.name,
-      description: runtime.path,
-      runtime
-    }));
+    .map((runtime) => {
+      const discovered = discoveredByPath.get(normalizeFsPath(runtime.path));
+      return {
+        label: discovered?.label ? `${discovered.label} (${runtime.name})` : runtime.name,
+        description: runtime.path,
+        runtime
+      };
+    });
 
   if (quickPickItems.length === 0) {
     return;
@@ -468,6 +595,90 @@ async function promptAndStoreWorkspaceDefaultRuntime(
 
   await config.update(JAVA_RUNTIMES_KEY, workspaceRuntimes, vscode.ConfigurationTarget.Workspace);
   vscode.window.showInformationMessage(`Set workspace default Java runtime to ${selected.runtime.name}.`);
+}
+
+function resolveWorkspaceSettingsDocument(): { uri: vscode.Uri; path: string[] } | undefined {
+  if (vscode.workspace.workspaceFile) {
+    return {
+      uri: vscode.workspace.workspaceFile,
+      path: ['settings', JAVA_CONFIG_SECTION + '.' + JAVA_RUNTIMES_KEY]
+    };
+  }
+
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  return workspaceFolder
+    ? {
+        uri: vscode.Uri.joinPath(workspaceFolder.uri, '.vscode', 'settings.json'),
+        path: [JAVA_CONFIG_SECTION + '.' + JAVA_RUNTIMES_KEY]
+      }
+    : undefined;
+}
+
+function resolveUserSettingsUri(globalStorageUri: vscode.Uri): vscode.Uri {
+  return vscode.Uri.joinPath(globalStorageUri, '..', '..', 'settings.json');
+}
+
+async function updateRuntimeSettingComments(
+  settingsUri: vscode.Uri,
+  propertyPath: string[],
+  discoveredByPath: ReadonlyMap<string, DiscoveredRuntime>,
+  results: vscode.OutputChannel
+): Promise<void> {
+  try {
+    const contents = Buffer.from(await vscode.workspace.fs.readFile(settingsUri)).toString('utf8');
+    const updated = updateRuntimeCommentsInText(contents, propertyPath, discoveredByPath);
+    if (updated !== contents) {
+      await vscode.workspace.fs.writeFile(settingsUri, Buffer.from(updated, 'utf8'));
+    }
+  } catch (error) {
+    results.appendLine(`Could not update runtime comments in ${settingsUri.toString()}: ${String(error)}`);
+  }
+}
+
+function updateRuntimeCommentsInText(
+  contents: string,
+  propertyPath: string[],
+  discoveredByPath: ReadonlyMap<string, Pick<DiscoveredRuntime, 'path' | 'label'>>
+): string {
+  const root = parseTree(contents);
+  const runtimesNode = root ? findNodeAtLocation(root, propertyPath) : undefined;
+  if (!runtimesNode?.children) {
+    return contents;
+  }
+
+  const labels = new Map([...discoveredByPath.values()]
+    .filter((runtime): runtime is Pick<DiscoveredRuntime, 'path'> & { label: string } => Boolean(runtime.label))
+    .map((runtime) => [normalizeFsPath(runtime.path), runtime.label.replace(/[\r\n]+/gu, ' ')]));
+  const lineEnding = contents.includes('\r\n') ? '\r\n' : '\n';
+  const edits: Array<{ offset: number; length: number; text: string }> = [];
+
+  for (const entryNode of runtimesNode.children) {
+    const entry = getNodeValue(entryNode) as JavaRuntimeConfigEntry;
+    const label = labels.get(normalizeFsPath(entry.path));
+    if (!label) {
+      continue;
+    }
+
+    const lineStart = contents.lastIndexOf('\n', entryNode.offset - 1) + 1;
+    const indentation = contents.slice(lineStart, entryNode.offset);
+    if (!/^\s*$/u.test(indentation)) {
+      continue;
+    }
+
+    const comment = `${indentation}// ${label}${lineEnding}`;
+    const previousLineEnd = Math.max(0, lineStart - lineEnding.length);
+    const previousLineStart = contents.lastIndexOf('\n', previousLineEnd - 1) + 1;
+    const previousLine = contents.slice(previousLineStart, previousLineEnd).replace(/\r$/u, '');
+    if (/^\s*\/\/ \[(?:JDK|JRE)(?: [^\]]+)?\].*$/u.test(previousLine)) {
+      edits.push({ offset: previousLineStart, length: lineStart - previousLineStart, text: comment });
+    } else {
+      edits.push({ offset: lineStart, length: 0, text: comment });
+    }
+  }
+
+  return edits
+    .sort((left, right) => right.offset - left.offset)
+    .reduce((updated, edit) => updated.slice(0, edit.offset) + edit.text + updated.slice(edit.offset + edit.length), contents);
 }
 
 function toJavaSeLabel(version: string): string | undefined {
@@ -503,6 +714,22 @@ function shouldSkipDirectory(name: string): boolean {
 
 function normalizeFsPath(filePath: string | undefined): string {
   return filePath ? path.normalize(filePath).toLowerCase() : '';
+}
+
+async function resolveRealPath(filePath: string): Promise<string> {
+  try {
+    return normalizeFsPath(await fs.realpath(filePath));
+  } catch {
+    return normalizeFsPath(filePath);
+  }
+}
+
+async function isDirectoryPath(filePath: string): Promise<boolean> {
+  try {
+    return (await fs.stat(filePath)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function compareDiscoveredRuntimes(left: DiscoveredRuntime, right: DiscoveredRuntime): number {
@@ -561,6 +788,10 @@ export const testables = {
   mergeWorkspaceRuntimes,
   normalizeFsPath,
   normalizeVersionParts,
+  resolveUserHomeDirectory,
+  resolveUserSettingsUri,
+  resolveVendor,
   shouldSkipDirectory,
-  toJavaSeLabel
+  toJavaSeLabel,
+  updateRuntimeCommentsInText
 };

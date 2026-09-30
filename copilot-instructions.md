@@ -2,6 +2,11 @@
 
 This repository is a VS Code extension and all changes must remain package-ready.
 
+## Semantic Versioning Requirement
+
+- Any code or functional change MUST include a semantic version increment in `package.json`.
+- Document all updates, fixes, and features under the new version in `CHANGELOG.md`.
+
 ## Mandatory Validation Workflow
 
 1. Make the requested change.

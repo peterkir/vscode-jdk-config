@@ -14,18 +14,20 @@ A Visual Studio Code extension that helps you discover Java runtimes and add the
 
 ## What It Does
 
-- Prompts for one or more root folders.
+- Asks whether to scan common Java installation locations for your OS or choose one or more folders manually.
 - Scans recursively for Java installations.
-- Uses the runtime root folder name as the `name` value.
-- If the folder name does not contain the detected Java version, appends `_<version>`.
+- Uses the detected Java version for the canonical execution environment `name` (for example, `JavaSE-21`).
+- Adds a JSONC comment above each runtime entry with its kind, major version, vendor, and full version.
 - Adds discovered Java homes to the `java.configuration.runtimes` setting.
 - Adds `sources` and `javadoc` when those paths are detected.
 - Prompts for which runtime should be the default for the current workspace and stores it in workspace settings.
+- Repeated scans add new runtimes and refresh existing entries from their Java installations; existing workspace defaults are retained if selection is canceled.
+- Shows folder and runtime counts while scanning, then lists versions and added/already-present status in the Java Runtime Configurator output channel.
 
 ## How It Works
 
 1. Run the command from the Command Palette.
-2. Select one or more root folders to scan.
+2. Choose common OS installation locations or select one or more folders manually.
 3. The extension searches recursively for directories that contain `bin/java` or `bin/java.exe`.
 4. If `javac` is present, the runtime is treated as a JDK; otherwise it is treated as a JRE.
 5. New runtimes are appended to `java.configuration.runtimes` in user settings.
@@ -33,49 +35,49 @@ A Visual Studio Code extension that helps you discover Java runtimes and add the
 
 ## Runtime Naming Rules
 
-- The runtime `name` starts with the Java home folder name.
-- If the detected Java version is already contained in the folder name, the folder name is used as-is.
-- If the version is missing from the folder name, the extension appends `_<version>`.
+- The runtime `name` is a standard execution environment ID, such as `JavaSE-18` (or `J2SE-1.5` for Java 1.5).
+- A comment above each runtime preserves descriptive details without adding unsupported properties to `java.configuration.runtimes`.
 - If sources or javadoc are found, they are added to the runtime entry.
 
 ## Example Workflow
 
 1. Open the Command Palette.
 2. Run `Java Runtimes: Scan Folders and Configure`.
-3. Select a folder such as `/usr/lib/jvm` or `C:\Java`.
+3. Scan common locations (Oracle, Temurin, GraalVM, Azul, and Amazon Corretto), or select a folder such as `/usr/lib/jvm` or `C:\Java`.
 4. Review the detected runtimes.
 5. Choose the default runtime for the current workspace when prompted.
 
-## Example Runtime Entry
+## Example Settings
+
+After selecting a workspace default, the workspace settings contain the complete runtime list with `default` set on the selected entry:
 
 ```json
-"java.configuration.runtimes": [
-	{
-		"name": "java-18-openjdk",
-		"path": "/usr/lib/jvm/java-18-openjdk",
-		"sources": "/usr/lib/jvm/java-18-openjdk/lib/src.zip",
-		"javadoc": "/usr/share/javadoc/java-18-openjdk/api",
-		"default": true
-	}
-]
+{
+	"java.configuration.runtimes": [
+		// [JDK 18] OpenJDK 18.0.2
+		{
+			"name": "JavaSE-18",
+			"path": "/usr/lib/jvm/java-18-openjdk",
+			"sources": "/usr/lib/jvm/java-18-openjdk/lib/src.zip",
+			"javadoc": "/usr/share/javadoc/java-18-openjdk/api",
+			"default": true
+		}
+	]
+}
 ```
+
+The entry is also added to user settings without `default`; `sources` and `javadoc` appear only when found.
 
 ## Limitations
 
 - The extension is intended for local filesystem runtimes.
+- Common-location scanning checks existing standard vendor installation folders under Program Files on Windows, JavaVirtualMachines on macOS, and JVM/vendor folders on Linux. Use manual selection for nonstandard locations.
 - Virtual workspaces are not supported.
-- Existing runtime entries are preserved and not rewritten unless the same path is newly added.
+- Existing runtime paths are retained, including paths that cannot be validated; valid installations have their runtime metadata refreshed on each scan.
 
 ## Development
 
-- Install dependencies: `npm install`
-- Build: `npm run compile`
-- Run tests: `npm test`
-- Package VSIX: `npm run package`
-
-## Testing
-
-The repository includes a VS Code extension test runner based on `@vscode/test-electron` and Mocha. The test suite validates command registration and the runtime naming/version helper logic.
+See [DEV.md](DEV.md) for prerequisites, development, local testing, packaging, and publishing.
 
 ## Troubleshooting
 

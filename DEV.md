@@ -22,16 +22,20 @@ For code or behavior changes, increment the semantic version in `package.json` (
 
 ## Test Locally
 
-1. Run `npm test` from the repository root. It compiles the project, then runs the Mocha extension suite in a VS Code test instance. Set `VSCODE_EXECUTABLE_PATH` to your VS Code executable if the runner cannot find one; otherwise it may download a test instance.
-2. Run `npm run compile`, close any previous Extension Development Host, then launch a new one from Git Bash:
+1. Run `npm test` from the repository root. It runs `npm run pretest` to compile the project, then launches the Mocha extension suite in a VS Code Extension Test Host. The test runner checks `VSCODE_EXECUTABLE_PATH` and common VS Code install locations, including this machine's install. If none is found, `@vscode/test-electron` may download a test instance.
+2. For manual checks, run `npm run compile`, close any previous Extension Development Host, then launch a new one from Git Bash:
 
 	```sh
-	"/c/idefix/apps/VSCode/bin/code" \
-	  --extensionDevelopmentPath="C:/git/github.com/peterkir/vscode-jre-config" \
-	  --new-window "C:/git/github.com/klibio/example.bnd.rcp/"
+	VSCODE_CLI="${VSCODE_CLI:-/c/idefix/apps/VSCode/bin/code}"
+	JRE_EXTENSION_DIR="${JRE_EXTENSION_DIR:-$(pwd -W)}"
+	JRE_SAMPLE_WORKSPACE="${JRE_SAMPLE_WORKSPACE:-../../klibio/example.bnd.rcp}"
+
+	"$VSCODE_CLI" \
+	  --extensionDevelopmentPath="$JRE_EXTENSION_DIR" \
+	  --new-window "$JRE_SAMPLE_WORKSPACE"
 	```
 
-	The example folder's `.vscode/settings.json` makes it a folder workspace but does not control which extension version runs. Open **Developer: Show Running Extensions** and confirm Java Runtime Configurator shows the version from this repository's `package.json`, not the installed Marketplace version. Run **Java Runtimes: Scan Folders and Configure** from the Command Palette and choose a folder containing a locally installed JDK or JRE. Inspect the Java Runtime Configurator output channel and `java.configuration.runtimes` in user and workspace settings. Repeat the command after changing a Java installation's `release` file to confirm existing labels and versions refresh; configured paths that no longer contain Java are reported but retained. Recompile and restart the development host after code changes.
+	Override `VSCODE_CLI` with your VS Code command-line launcher, `JRE_EXTENSION_DIR` with this extension's root, or `JRE_SAMPLE_WORKSPACE` with another folder to test. This manual Extension Development Host is separate from the automated test host started by `npm test`. The example folder's `.vscode/settings.json` makes it a folder workspace but does not control which extension version runs. Open **Developer: Show Running Extensions** and confirm Java Runtime Configurator shows the version from this repository's `package.json`, not the installed Marketplace version. Run **Java Runtimes: Scan Folders and Configure** from the Command Palette and choose a folder containing a locally installed JDK or JRE. Inspect the Java Runtime Configurator output channel and `java.configuration.runtimes` in user and workspace settings. Repeat the command after changing a Java installation's `release` file to confirm existing labels and versions refresh; configured paths that no longer contain Java are reported but retained. Recompile and restart the development host after code changes.
 3. Run `npm run package` to compile and create a versioned `.vsix` file. To test the distributable before publishing, install it in a separate VS Code profile with `"/c/idefix/apps/VSCode/bin/code" --profile "JRE Config Test" --install-extension <generated-file>.vsix`, then open the example workspace with `"/c/idefix/apps/VSCode/bin/code" --profile "JRE Config Test" --new-window "C:/git/github.com/klibio/example.bnd.rcp/"` and repeat the scan. Do not publish until both `npm run compile` and `npm run package` succeed.
 
 ## Publish
